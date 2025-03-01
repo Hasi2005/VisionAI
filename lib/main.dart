@@ -7,12 +7,18 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' show join;
-// codes taking pictures and sending to flask ml server for now ... change later 
+import 'package:web_socket_channel/io.dart';
+import 'package:google_ml_kit/google_ml_kit.dart';
+import 'package:image/image.dart' as img;
+import 'dart:math';
+import 'dart:typed_data';
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final cameras = await availableCameras();
   final backCamera = cameras.firstWhere(
     (camera) => camera.lensDirection == CameraLensDirection.back,
+    orElse: () => cameras.first,
   );
 
   runApp(MyApp(camera: backCamera));
@@ -60,13 +66,30 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   late CameraController _controller;
   late Future<void> _initializeControllerFuture;
-  String selectedMode = ""; // nothing selected case 
+  String selectedMode = ""; 
   bool isProcessing = false;
+  bool isStreaming = false;
+  bool isGeneratingCaptions = false;
   String? resultText;
-  Timer? _liveProcessingTimer;
-  //API config ML 
-  final String apiUrl = "http://192.168.0.214:5000/predict"; // device flas api endpoint ... currently this .. change if restarted 
-
+  Image? streamImage;
+  Timer? _streamUpdateTimer;
+  Timer? _captionUpdateTimer;
+  
+  // Caption generation
+  final ImageLabeler _imageLabeler = GoogleMlKit.vision.imageLabeler();
+  final TextRecognizer _textRecognizer = GoogleMlKit.vision.textRecognizer();
+  final ObjectDetector _objectDetector = GoogleMlKit.vision.objectDetector(
+    options: ObjectDetectorOptions(
+      mode: DetectionMode.stream,
+      classifyObjects: true,
+      multipleObjects: true,
+    ),
+  );
+  
+  // API config for video streaming
+  final String apiBaseUrl = "http://192.168.0.214:5000"; // Update with your server IP
+  final String streamUrl = "http://192.168.0.214:5000/api/stream"; // Stream endpoint
+  
   @override
   void initState() {
     super.initState();
@@ -78,7 +101,7 @@ class _HomePageState extends State<HomePage> {
       camera,
       ResolutionPreset.high,
     );
-    _controller.lockCaptureOrientation(DeviceOrientation.portraitUp); // only portrait works
+    _controller.lockCaptureOrientation(DeviceOrientation.portraitUp);
     _initializeControllerFuture = _controller.initialize().then((_) {
       if (!mounted) return;
       setState(() {});
@@ -87,73 +110,198 @@ class _HomePageState extends State<HomePage> {
   
   @override
   void dispose() {
-    _stopLiveProcessing();
+    _stopLiveStreaming();
+    _stopCaptionGeneration();
+    _imageLabeler.close();
+    _textRecognizer.close();
+    _objectDetector.close();
     _controller.dispose();
     super.dispose();
   }
-  void _startLiveProcessing() {
-    _liveProcessingTimer?.cancel();//exisiting timer cancelled ? 
-    _liveProcessingTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) { // every 500 ms captures frame 
-      if (!isProcessing && selectedMode.isNotEmpty) {
-        _processFrame();
+
+  void _startCaptionGeneration() {
+    if (isGeneratingCaptions) return;
+    
+    setState(() {
+      isGeneratingCaptions = true;
+      resultText = "Caption generation started";
+    });
+    
+    _captionUpdateTimer = Timer.periodic(const Duration(milliseconds: 1000), (timer) async {
+      if (!isGeneratingCaptions) {
+        timer.cancel();
+        return;
+      }
+      
+      try {
+        XFile imageFile = await _controller.takePicture();
+        final inputImage = InputImage.fromFilePath(imageFile.path);
+        
+        // Use ML Kit to process the image
+        final labels = await _imageLabeler.processImage(inputImage);
+        final recognizedText = await _textRecognizer.processImage(inputImage);
+        final detectedObjects = await _objectDetector.processImage(inputImage);
+        
+        // Create a comprehensive caption based on detected elements
+        StringBuffer captionBuffer = StringBuffer("I see: ");
+        
+        // Add labels (general scene understanding)
+        if (labels.isNotEmpty) {
+          List<String> labelTexts = labels
+              .take(3)
+              .map((label) => "${label.label} (${(label.confidence * 100).toStringAsFixed(0)}%)")
+              .toList();
+          captionBuffer.write(labelTexts.join(", "));
+        }
+        
+        // Add objects
+        if (detectedObjects.isNotEmpty) {
+          captionBuffer.write(". Objects: ");
+          List<String> objectTexts = detectedObjects
+              .take(3)
+              .map((obj) => "${obj.labels.first.text}")
+              .toList();
+          captionBuffer.write(objectTexts.join(", "));
+        }
+        
+        // Add text if any is recognized
+        if (recognizedText.text.isNotEmpty) {
+          String shortText = recognizedText.text.length > 50 
+              ? "${recognizedText.text.substring(0, 50)}..." 
+              : recognizedText.text;
+          captionBuffer.write(". Text: \"$shortText\"");
+        }
+        
+        setState(() {
+          resultText = captionBuffer.toString();
+        });
+        
+        // Delete the temporary image file
+        File(imageFile.path).deleteSync();
+        
+      } catch (e) {
+        setState(() {
+          resultText = "Caption error: ${e.toString().substring(0, 50)}";
+        });
       }
     });
   }
-  void _stopLiveProcessing() {
-    _liveProcessingTimer?.cancel();
-    _liveProcessingTimer = null;
+  
+  void _stopCaptionGeneration() {
+    _captionUpdateTimer?.cancel();
+    _captionUpdateTimer = null;
+    
+    setState(() {
+      isGeneratingCaptions = false;
+      resultText = "Caption generation stopped";
+    });
   }
-  Future<void> _processFrame() async {
-    if (selectedMode.isEmpty) {
+
+  // Modified streaming implementation
+  // Replace the _startLiveStreaming and _stopLiveStreaming methods with these improved versions
+void _startLiveStreaming() {
+  if (isStreaming) return;
+  
+  setState(() {
+    isStreaming = true;
+    resultText = "Streaming started - connecting to server...";
+  });
+  
+  // Start sending frames to the server
+  _streamUpdateTimer = Timer.periodic(const Duration(milliseconds: 700), (timer) async {
+    if (!isStreaming) {
+      timer.cancel();
       return;
     }
-    try {
-      setState(() {
-        isProcessing = true;
-      });
-      await _initializeControllerFuture;
-      final XFile image = await _controller.takePicture();
-      final prediction = await _uploadImageForPrediction(image.path, selectedMode); // uplaoding to server part 
-      
-      setState(() {
-        resultText = prediction;
-        isProcessing = false;
-      });
-      
-    } catch (e) {
-      setState(() {
-        isProcessing = false;
-        resultText = "Error: ${e.toString()}";
-      });
-    }
-  }
-  
-  // flask ml server uploading image for now 
-  Future<String> _uploadImageForPrediction(String imagePath, String mode) async {
-    final File imageFile = File(imagePath);
-    final bytes = await imageFile.readAsBytes();
-    final base64Image = base64Encode(bytes);
     
     try {
-      final response = await http.post(
-        Uri.parse(apiUrl),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode({
-          'image': base64Image,
-          'mode': mode.toLowerCase() // text/scene sending (look if needed )
-        }),
-      ).timeout(const Duration(seconds: 30));
+      // Capture image from camera
+      XFile imageFile = await _controller.takePicture();
+      File file = File(imageFile.path);
       
-      if (response.statusCode == 200) {
-        final responseData = json.decode(response.body);
-        return responseData['prediction'] ?? 'No result found';
+      // Create multipart request
+      var request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/api/send_frame'));
+      request.files.add(
+        await http.MultipartFile.fromPath('image', file.path)
+      );
+      
+      // Send the frame to server
+      var streamResponse = await request.send();
+      if (streamResponse.statusCode == 200) {
+        var responseData = await streamResponse.stream.bytesToString();
+        Map<String, dynamic> jsonResponse = jsonDecode(responseData);
+        
+        // Update caption text from server response
+        if (jsonResponse.containsKey('caption')) {
+          setState(() {
+            resultText = jsonResponse['caption'];
+          });
+        }
       } else {
-        return 'Server error: ${response.statusCode}';
+        setState(() {
+          resultText = "Error: Server returned ${streamResponse.statusCode}";
+        });
       }
+      
+      // Update the stream image
+      setState(() {
+        // Force rebuild to refresh the stream image with a unique URL to prevent caching
+        streamImage = Image.network(
+          '$streamUrl?t=${DateTime.now().millisecondsSinceEpoch}',
+          fit: BoxFit.cover,
+          frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+            return child;
+          },
+          loadingBuilder: (context, child, loadingProgress) {
+            if (loadingProgress == null) return child;
+            return Center(
+              child: CircularProgressIndicator(
+                value: loadingProgress.expectedTotalBytes != null
+                    ? loadingProgress.cumulativeBytesLoaded / loadingProgress.expectedTotalBytes!
+                    : null,
+              ),
+            );
+          },
+          errorBuilder: (context, error, stackTrace) {
+            return Center(
+              child: Text(
+                "Stream connection error. Retrying...",
+                style: TextStyle(color: Colors.white),
+                textAlign: TextAlign.center,
+              ),
+            );
+          },
+        );
+      });
+      
+      // Clean up the image file
+      await file.delete();
+      
     } catch (e) {
-      return 'Connection error: ${e.toString()}';
+      setState(() {
+        resultText = "Error: ${e.toString().substring(0, min(50, e.toString().length))}";
+      });
     }
+  });
+}
+
+void _stopLiveStreaming() {
+  _streamUpdateTimer?.cancel();
+  _streamUpdateTimer = null;
+  
+  // Make a final request to the server to stop processing
+  try {
+    http.get(Uri.parse('$apiBaseUrl/api/health'));
+  } catch (e) {
+    // Ignore errors when stopping
   }
+  
+  setState(() {
+    isStreaming = false;
+    streamImage = null;
+    resultText = "Streaming stopped";
+  });
+}
 
   @override
   Widget build(BuildContext context) {
@@ -172,6 +320,20 @@ class _HomePageState extends State<HomePage> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         shadowColor: Colors.transparent,
+        actions: [
+          // Exit button stops captions or streaming
+          IconButton(
+            icon: Icon(Icons.exit_to_app, color: Colors.white),
+            onPressed: () {
+              if (isGeneratingCaptions) {
+                _stopCaptionGeneration();
+              } else if (isStreaming) {
+                _stopLiveStreaming();
+              }
+            },
+            tooltip: "Stop",
+          ),
+        ],
       ),
       body: Stack(
         children: [
@@ -186,45 +348,58 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
           ),
-          // cam
+          
+          // Display either camera preview or stream
           Positioned.fill(
-            child: FutureBuilder<void>(
-              future: _initializeControllerFuture,
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.done) {
-                  final size = MediaQuery.of(context).size;
-                  return Container(
-                    width: size.width,
-                    height: size.height,
-                    padding: const EdgeInsets.only(top: 0, bottom: 100),
-                    child: Center(
-                      child: Container(
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(20),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withOpacity(0.2),
-                              blurRadius: 15,
-                              spreadRadius: 5,
+            child: isStreaming 
+              ? (streamImage ?? Container(
+                  color: Colors.black,
+                  child: const Center(
+                    child: Text(
+                      "Connecting to stream...",
+                      style: TextStyle(color: Colors.white),
+                    ),
+                  ),
+                ))
+              : FutureBuilder<void>(
+                  future: _initializeControllerFuture,
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.done) {
+                      final size = MediaQuery.of(context).size;
+                      return Container(
+                        width: size.width,
+                        height: size.height,
+                        padding: const EdgeInsets.only(top: 0, bottom: 100),
+                        child: Center(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(20),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(0.2),
+                                  blurRadius: 15,
+                                  spreadRadius: 5,
+                                ),
+                              ],
                             ),
-                          ],
-                        ),
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(20),
-                          child: Transform.rotate(
-                            angle: 90 * (3.1415926535897932 / 180),
-                            child: SizedBox(
-                              width: size.height,
-                              height: size.width,
-                              child: ClipRect(
-                                child: OverflowBox(
-                                  alignment: Alignment.center,
-                                  child: FittedBox(
-                                    fit: BoxFit.cover,
-                                    child: SizedBox(
-                                      width: size.height * _controller.value.aspectRatio,
-                                      height: size.height,
-                                      child: CameraPreview(_controller),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(20),
+                              child: Transform.rotate(
+                                angle: 90 * (3.1415926535897932 / 180),
+                                child: SizedBox(
+                                  width: size.height,
+                                  height: size.width,
+                                  child: ClipRect(
+                                    child: OverflowBox(
+                                      alignment: Alignment.center,
+                                      child: FittedBox(
+                                        fit: BoxFit.cover,
+                                        child: SizedBox(
+                                          width: size.height * _controller.value.aspectRatio,
+                                          height: size.height,
+                                          child: CameraPreview(_controller),
+                                        ),
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -232,32 +407,29 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ),
                         ),
-                      ),
-                    ),
-                  );
-                } else {
-                  return Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const CircularProgressIndicator(),
-                        const SizedBox(height: 16),
-                        Text(
-                          "Initializing camera...",
-                          style: TextStyle(
-                            color: Theme.of(context).colorScheme.secondary,
-                          ),
+                      );
+                    } else {
+                      return Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const CircularProgressIndicator(),
+                            const SizedBox(height: 16),
+                            Text(
+                              "Initializing camera...",
+                              style: TextStyle(
+                                color: Theme.of(context).colorScheme.secondary,
+                              ),
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
-                  );
-                }
-              },
-            ),
+                      );
+                    }
+                  },
+                ),
           ),
           
-          
-         //loading thing 
+          // Loading overlay
           if (isProcessing)
             Container(
               color: Colors.black.withOpacity(0.5),
@@ -276,6 +448,28 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
 
+          // Status text
+          if (resultText != null)
+            Positioned(
+              top: 100,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: EdgeInsets.all(8),
+                margin: EdgeInsets.symmetric(horizontal: 12),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  resultText!,
+                  style: TextStyle(color: Colors.white),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
+
+          // Mode selection buttons
           Align(
             alignment: const Alignment(0.0, 0.85),
             child: Container(
@@ -300,36 +494,32 @@ class _HomePageState extends State<HomePage> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
+                      // TEXT button (now just a "dummy" button)
                       GestureDetector(
                         onTap: () {
+                          // Do nothing - this button is now non-functional
                           setState(() {
-                            selectedMode = "TEXT";
-                            _startLiveProcessing(); // can include toggle maybe ? but woudln't be useful 
+                            resultText = "Text button is disabled";
                           });
-                          print("Text mode selected");
+                          // Auto-clear the message after 2 seconds
+                          Timer(Duration(seconds: 2), () {
+                            if (mounted) {
+                              setState(() {
+                                resultText = null;
+                              });
+                            }
+                          });
                         },
                         child: Container(
                           width: 120,
                           padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
                           decoration: BoxDecoration(
-                            color: selectedMode == "TEXT" ? Colors.white : Colors.transparent,
+                            color: Colors.transparent,
                             borderRadius: BorderRadius.circular(16),
                             border: Border.all(
-                              color: selectedMode == "TEXT" 
-                                ? Theme.of(context).colorScheme.primary 
-                                : Colors.grey.withOpacity(0.5),
+                              color: Colors.grey.withOpacity(0.5),
                               width: 2,
                             ),
-                            boxShadow: selectedMode == "TEXT"
-                              ? [
-                                  BoxShadow(
-                                    color: Colors.black.withOpacity(0.1),
-                                    blurRadius: 8,
-                                    spreadRadius: 1,
-                                    offset: const Offset(0, 2),
-                                  ),
-                                ]
-                              : null,
                           ),
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
@@ -337,9 +527,7 @@ class _HomePageState extends State<HomePage> {
                               Icon(
                                 Icons.text_fields,
                                 size: 36,
-                                color: selectedMode == "TEXT" 
-                                  ? Theme.of(context).colorScheme.primary 
-                                  : Theme.of(context).colorScheme.onSurface,
+                                color: Theme.of(context).colorScheme.onSurface,
                               ),
                               const SizedBox(height: 8),
                               Text(
@@ -347,9 +535,7 @@ class _HomePageState extends State<HomePage> {
                                 style: TextStyle(
                                   fontSize: 14,
                                   fontWeight: FontWeight.bold,
-                                  color: selectedMode == "TEXT" 
-                                    ? Theme.of(context).colorScheme.primary 
-                                    : Theme.of(context).colorScheme.onSurface,
+                                  color: Theme.of(context).colorScheme.onSurface,
                                 ),
                               ),
                             ],
@@ -359,27 +545,31 @@ class _HomePageState extends State<HomePage> {
                       
                       const SizedBox(width: 16),
                       
+                      // STREAM button (toggle live streaming)
                       GestureDetector(
                         onTap: () {
-                          setState(() {
-                            selectedMode = "SCENE";
-                            _startLiveProcessing(); // same here 
-                          });
-                          print("Scene mode selected");
+                          if (isStreaming) {
+                            _stopLiveStreaming();
+                          } else {
+                            setState(() {
+                              selectedMode = "STREAM";
+                            });
+                            _startLiveStreaming();
+                          }
                         },
                         child: Container(
                           width: 120,
                           padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
                           decoration: BoxDecoration(
-                            color: selectedMode == "SCENE" ? Colors.white : Colors.transparent,
+                            color: isStreaming ? Colors.white : Colors.transparent,
                             borderRadius: BorderRadius.circular(16),
                             border: Border.all(
-                              color: selectedMode == "SCENE" 
+                              color: isStreaming 
                                 ? Theme.of(context).colorScheme.primary 
                                 : Colors.grey.withOpacity(0.5),
                               width: 2,
                             ),
-                            boxShadow: selectedMode == "SCENE"
+                            boxShadow: isStreaming
                               ? [
                                   BoxShadow(
                                     color: Colors.black.withOpacity(0.1),
@@ -394,19 +584,19 @@ class _HomePageState extends State<HomePage> {
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(
-                                Icons.photo_camera,
+                                isStreaming ? Icons.stop : Icons.video_camera_back,
                                 size: 36,
-                                color: selectedMode == "SCENE" 
+                                color: isStreaming 
                                   ? Theme.of(context).colorScheme.primary
                                   : Theme.of(context).colorScheme.onSurface,
                               ),
                               const SizedBox(height: 8),
                               Text(
-                                "SCENE",
+                                isStreaming ? "STOP" : "STREAM",
                                 style: TextStyle(
                                   fontSize: 14,
                                   fontWeight: FontWeight.bold,
-                                  color: selectedMode == "SCENE" 
+                                  color: isStreaming 
                                     ? Theme.of(context).colorScheme.primary 
                                     : Theme.of(context).colorScheme.onSurface,
                                 ),
