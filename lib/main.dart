@@ -83,26 +83,50 @@ class _HomePageState extends State<HomePage> {
       ),
       body: Stack(
         children: [
-          FutureBuilder<void>(
-            future: _initializeControllerFuture,
-            builder: (context, snapshot) {
-              if (snapshot.connectionState == ConnectionState.done) {
-                // Ensure the camera preview is displayed vertically
-                return Center(
-                  child: Transform.rotate(
-                    angle: 90 * (3.1415926535897932 / 180), // Rotate 90 degrees
-                    child: AspectRatio(
-                      aspectRatio: _controller.value.aspectRatio,
-                      child: CameraPreview(_controller),
+          // Modified this part to position the camera higher
+          Positioned.fill(
+            child: FutureBuilder<void>(
+              future: _initializeControllerFuture,
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.done) {
+                  // Get the screen size
+                  final size = MediaQuery.of(context).size;
+                  
+                  return Container(
+                    width: size.width,
+                    height: size.height,
+                    // Add padding to the top to move camera view higher
+                    padding: EdgeInsets.only(top: 0, bottom: 100),
+                    child: Center(
+                      child: Transform.rotate(
+                        angle: 90 * (3.1415926535897932 / 180), // Rotate 90 degrees
+                        child: SizedBox(
+                          width: size.height, // Use the screen height as width after rotation
+                          height: size.width, // Use the screen width as height after rotation
+                          child: ClipRect(
+                            child: OverflowBox(
+                              alignment: Alignment.center,
+                              child: FittedBox(
+                                fit: BoxFit.cover,
+                                child: SizedBox(
+                                  width: size.height * _controller.value.aspectRatio,
+                                  height: size.height,
+                                  child: CameraPreview(_controller),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
-                );
-              } else {
-                return const Center(
-                  child: CircularProgressIndicator(),
-                );
-              }
-            },
+                  );
+                } else {
+                  return const Center(
+                    child: CircularProgressIndicator(),
+                  );
+                }
+              },
+            ),
           ),
           Align(
             alignment: Alignment(0.0, 0.85),
