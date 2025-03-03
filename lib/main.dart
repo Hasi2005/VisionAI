@@ -12,6 +12,8 @@ import 'package:google_ml_kit/google_ml_kit.dart';
 import 'package:image/image.dart' as img;
 import 'dart:math';
 import 'dart:typed_data';
+import 'vid_upload.dart';
+import 'dart:convert';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -87,8 +89,8 @@ class _HomePageState extends State<HomePage> {
   );
   
   // API config for video streaming
-  final String apiBaseUrl = "http://192.168.0.214:5000"; // Update with your server IP
-  final String streamUrl = "http://192.168.0.214:5000/api/stream"; // Stream endpoint
+  final String apiBaseUrl = "http://10.135.60.170:5000"; // Update with your server IP
+  final String streamUrl = "http://10.135.60.170:5000/api/stream"; // Stream endpoint
   
   @override
   void initState() {
@@ -320,20 +322,32 @@ void _stopLiveStreaming() {
         backgroundColor: Colors.transparent,
         elevation: 0,
         shadowColor: Colors.transparent,
-        actions: [
-          // Exit button stops captions or streaming
-          IconButton(
-            icon: Icon(Icons.exit_to_app, color: Colors.white),
-            onPressed: () {
-              if (isGeneratingCaptions) {
-                _stopCaptionGeneration();
-              } else if (isStreaming) {
-                _stopLiveStreaming();
-              }
-            },
-            tooltip: "Stop",
-          ),
-        ],
+        // Add this inside the actions list in the AppBar in your HomePage build method:
+actions: [
+  // Video upload button
+  IconButton(
+    icon: Icon(Icons.file_upload, color: Colors.white),
+    onPressed: () {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => const VideoUploadPage()),
+      );
+    },
+    tooltip: "Upload Video",
+  ),
+  // Existing exit button
+  IconButton(
+    icon: Icon(Icons.exit_to_app, color: Colors.white),
+    onPressed: () {
+      if (isGeneratingCaptions) {
+        _stopCaptionGeneration();
+      } else if (isStreaming) {
+        _stopLiveStreaming();
+      }
+    },
+    tooltip: "Stop",
+  ),
+],
       ),
       body: Stack(
         children: [
