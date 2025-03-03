@@ -77,7 +77,6 @@ class _HomePageState extends State<HomePage> {
   Timer? _streamUpdateTimer;
   Timer? _captionUpdateTimer;
   
-  // Caption generation
   final ImageLabeler _imageLabeler = GoogleMlKit.vision.imageLabeler();
   final TextRecognizer _textRecognizer = GoogleMlKit.vision.textRecognizer();
   final ObjectDetector _objectDetector = GoogleMlKit.vision.objectDetector(
@@ -87,10 +86,8 @@ class _HomePageState extends State<HomePage> {
       multipleObjects: true,
     ),
   );
-  
-  // API config for video streaming
-  final String apiBaseUrl = "http://10.135.60.170:5000"; // Update with your server IP
-  final String streamUrl = "http://10.135.60.170:5000/api/stream"; // Stream endpoint
+  final String apiBaseUrl = "https://vision-ai-backend-yr0v.onrender.com"; // deployed on render .. not working 
+  final String streamUrl = "https://vision-ai-backend-yr0v.onrender.com/api/stream"; // Stream endpoint
   
   @override
   void initState() {
@@ -138,16 +135,10 @@ class _HomePageState extends State<HomePage> {
       try {
         XFile imageFile = await _controller.takePicture();
         final inputImage = InputImage.fromFilePath(imageFile.path);
-        
-        // Use ML Kit to process the image
         final labels = await _imageLabeler.processImage(inputImage);
         final recognizedText = await _textRecognizer.processImage(inputImage);
         final detectedObjects = await _objectDetector.processImage(inputImage);
-        
-        // Create a comprehensive caption based on detected elements
         StringBuffer captionBuffer = StringBuffer("I see: ");
-        
-        // Add labels (general scene understanding)
         if (labels.isNotEmpty) {
           List<String> labelTexts = labels
               .take(3)
@@ -155,8 +146,6 @@ class _HomePageState extends State<HomePage> {
               .toList();
           captionBuffer.write(labelTexts.join(", "));
         }
-        
-        // Add objects
         if (detectedObjects.isNotEmpty) {
           captionBuffer.write(". Objects: ");
           List<String> objectTexts = detectedObjects
@@ -165,8 +154,6 @@ class _HomePageState extends State<HomePage> {
               .toList();
           captionBuffer.write(objectTexts.join(", "));
         }
-        
-        // Add text if any is recognized
         if (recognizedText.text.isNotEmpty) {
           String shortText = recognizedText.text.length > 50 
               ? "${recognizedText.text.substring(0, 50)}..." 
@@ -177,8 +164,6 @@ class _HomePageState extends State<HomePage> {
         setState(() {
           resultText = captionBuffer.toString();
         });
-        
-        // Delete the temporary image file
         File(imageFile.path).deleteSync();
         
       } catch (e) {
@@ -199,8 +184,7 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  // Modified streaming implementation
-  // Replace the _startLiveStreaming and _stopLiveStreaming methods with these improved versions
+ 
 void _startLiveStreaming() {
   if (isStreaming) return;
   
@@ -209,7 +193,7 @@ void _startLiveStreaming() {
     resultText = "Streaming started - connecting to server...";
   });
   
-  // Start sending frames to the server
+  
   _streamUpdateTimer = Timer.periodic(const Duration(milliseconds: 700), (timer) async {
     if (!isStreaming) {
       timer.cancel();
@@ -217,23 +201,19 @@ void _startLiveStreaming() {
     }
     
     try {
-      // Capture image from camera
+     
       XFile imageFile = await _controller.takePicture();
       File file = File(imageFile.path);
       
-      // Create multipart request
       var request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/api/send_frame'));
       request.files.add(
         await http.MultipartFile.fromPath('image', file.path)
       );
       
-      // Send the frame to server
       var streamResponse = await request.send();
       if (streamResponse.statusCode == 200) {
         var responseData = await streamResponse.stream.bytesToString();
         Map<String, dynamic> jsonResponse = jsonDecode(responseData);
-        
-        // Update caption text from server response
         if (jsonResponse.containsKey('caption')) {
           setState(() {
             resultText = jsonResponse['caption'];
@@ -245,9 +225,9 @@ void _startLiveStreaming() {
         });
       }
       
-      // Update the stream image
+     
       setState(() {
-        // Force rebuild to refresh the stream image with a unique URL to prevent caching
+        
         streamImage = Image.network(
           '$streamUrl?t=${DateTime.now().millisecondsSinceEpoch}',
           fit: BoxFit.cover,
@@ -276,7 +256,7 @@ void _startLiveStreaming() {
         );
       });
       
-      // Clean up the image file
+     
       await file.delete();
       
     } catch (e) {
@@ -290,12 +270,11 @@ void _startLiveStreaming() {
 void _stopLiveStreaming() {
   _streamUpdateTimer?.cancel();
   _streamUpdateTimer = null;
-  
-  // Make a final request to the server to stop processing
+ 
   try {
     http.get(Uri.parse('$apiBaseUrl/api/health'));
   } catch (e) {
-    // Ignore errors when stopping
+    // ignore 
   }
   
   setState(() {
@@ -322,7 +301,7 @@ void _stopLiveStreaming() {
         backgroundColor: Colors.transparent,
         elevation: 0,
         shadowColor: Colors.transparent,
-        // Add this inside the actions list in the AppBar in your HomePage build method:
+       
 actions: [
   // Video upload button
   IconButton(
@@ -335,7 +314,7 @@ actions: [
     },
     tooltip: "Upload Video",
   ),
-  // Existing exit button
+  //  exit button
   IconButton(
     icon: Icon(Icons.exit_to_app, color: Colors.white),
     onPressed: () {
@@ -363,7 +342,7 @@ actions: [
             ),
           ),
           
-          // Display either camera preview or stream
+          
           Positioned.fill(
             child: isStreaming 
               ? (streamImage ?? Container(
@@ -443,7 +422,7 @@ actions: [
                 ),
           ),
           
-          // Loading overlay
+          // Loading 
           if (isProcessing)
             Container(
               color: Colors.black.withOpacity(0.5),
@@ -462,7 +441,7 @@ actions: [
               ),
             ),
 
-          // Status text
+          
           if (resultText != null)
             Positioned(
               top: 100,
@@ -482,8 +461,6 @@ actions: [
                 ),
               ),
             ),
-
-          // Mode selection buttons
           Align(
             alignment: const Alignment(0.0, 0.85),
             child: Container(
@@ -508,14 +485,14 @@ actions: [
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
-                      // TEXT button (now just a "dummy" button)
+                      
                       GestureDetector(
                         onTap: () {
-                          // Do nothing - this button is now non-functional
+                          // nothing doing 
                           setState(() {
                             resultText = "Text button is disabled";
                           });
-                          // Auto-clear the message after 2 seconds
+                          // auto clearing happening after 2 seconds 
                           Timer(Duration(seconds: 2), () {
                             if (mounted) {
                               setState(() {
@@ -559,7 +536,7 @@ actions: [
                       
                       const SizedBox(width: 16),
                       
-                      // STREAM button (toggle live streaming)
+                      // toggling live stream 
                       GestureDetector(
                         onTap: () {
                           if (isStreaming) {
