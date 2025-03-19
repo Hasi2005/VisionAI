@@ -20,8 +20,8 @@ class _VideoUploadPageState extends State<VideoUploadPage> {
   String? _uploadResult;
   VideoPlayerController? _videoController;
 
-  // API config
-  final String apiBaseUrl = "http://192.168.1.34:5000"; // Match your existing API URL
+  // API config - updated to match main.dart
+  final String apiBaseUrl = "http://10.135.60.170:5000";
 
   Future<void> _pickVideo() async {
     FilePickerResult? result = await FilePicker.platform.pickFiles(

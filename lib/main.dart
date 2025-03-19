@@ -7,13 +7,12 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' show join;
-import 'package:web_socket_channel/io.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:google_ml_kit/google_ml_kit.dart';
 import 'package:image/image.dart' as img;
 import 'dart:math';
 import 'dart:typed_data';
 import 'vid_upload.dart';
-import 'dart:convert';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -73,9 +72,13 @@ class _HomePageState extends State<HomePage> {
   bool isStreaming = false;
   bool isGeneratingCaptions = false;
   String? resultText;
-  Image? streamImage;
-  Timer? _streamUpdateTimer;
+  RTCVideoRenderer? _remoteRenderer;
   Timer? _captionUpdateTimer;
+  Timer? _connectionCheckTimer;
+  
+  // WebRTC properties
+  RTCPeerConnection? _peerConnection;
+  MediaStream? _localStream;
   
   final ImageLabeler _imageLabeler = GoogleMlKit.vision.imageLabeler();
   final TextRecognizer _textRecognizer = GoogleMlKit.vision.textRecognizer();
@@ -86,13 +89,15 @@ class _HomePageState extends State<HomePage> {
       multipleObjects: true,
     ),
   );
-  final String apiBaseUrl = "https://vision-ai-backend-yr0v.onrender.com"; // deployed on render .. not working 
-  final String streamUrl = "https://vision-ai-backend-yr0v.onrender.com/api/stream"; // Stream endpoint
+  
+  // IP address configuration - update this with your server IP
+  final String apiBaseUrl = "http://10.135.60.170:5000"; // Update with your server IP
   
   @override
   void initState() {
     super.initState();
     _initializeCamera(widget.camera);
+    _initRenderers();
   }
 
   void _initializeCamera(CameraDescription camera) {
@@ -107,6 +112,11 @@ class _HomePageState extends State<HomePage> {
     });
   }
   
+  Future<void> _initRenderers() async {
+    _remoteRenderer = RTCVideoRenderer();
+    await _remoteRenderer!.initialize();
+  }
+  
   @override
   void dispose() {
     _stopLiveStreaming();
@@ -115,6 +125,8 @@ class _HomePageState extends State<HomePage> {
     _textRecognizer.close();
     _objectDetector.close();
     _controller.dispose();
+    _remoteRenderer?.dispose();
+    _connectionCheckTimer?.cancel();
     super.dispose();
   }
 
@@ -168,7 +180,7 @@ class _HomePageState extends State<HomePage> {
         
       } catch (e) {
         setState(() {
-          resultText = "Caption error: ${e.toString().substring(0, 50)}";
+          resultText = "Caption error: ${e.toString().substring(0, min(50, e.toString().length))}";
         });
       }
     });
@@ -184,105 +196,177 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
- 
-void _startLiveStreaming() {
-  if (isStreaming) return;
-  
-  setState(() {
-    isStreaming = true;
-    resultText = "Streaming started - connecting to server...";
-  });
-  
-  
-  _streamUpdateTimer = Timer.periodic(const Duration(milliseconds: 700), (timer) async {
-    if (!isStreaming) {
-      timer.cancel();
+  // Updated WebRTC implementation to match Python backend
+  Future<void> _createPeerConnection() async {
+    Map<String, dynamic> configuration = {
+      "iceServers": [
+        {"urls": "stun:stun.l.google.com:19302"},
+      ]
+    };
+
+    final Map<String, dynamic> offerSdpConstraints = {
+      "mandatory": {
+        "OfferToReceiveAudio": false,
+        "OfferToReceiveVideo": true,
+      },
+      "optional": [],
+    };
+
+    _peerConnection = await createPeerConnection(configuration);
+
+    _peerConnection!.onIceCandidate = (candidate) {
+      // Send candidate to server
+      _sendIceCandidate(candidate);
+    };
+
+    _peerConnection!.onAddStream = (stream) {
+      setState(() {
+        _remoteRenderer?.srcObject = stream;
+      });
+    };
+
+    // Get local stream from camera
+    final Map<String, dynamic> mediaConstraints = {
+      'audio': false,
+      'video': {
+        'facingMode': 'environment',
+        'width': {'ideal': 1280},
+        'height': {'ideal': 720}
+      }
+    };
+
+    _localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+    _localStream!.getTracks().forEach((track) {
+      _peerConnection!.addTrack(track, _localStream!);
+    });
+
+    // Create offer
+    RTCSessionDescription offer = await _peerConnection!.createOffer(offerSdpConstraints);
+    await _peerConnection!.setLocalDescription(offer);
+
+    // Send offer to server
+    await _sendOffer(offer);
+  }
+
+  Future<void> _sendOffer(RTCSessionDescription offer) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$apiBaseUrl/webrtc/offer'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'sdp': offer.sdp,
+          'type': offer.type,
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        Map<String, dynamic> body = jsonDecode(response.body);
+        String sdp = body['sdp'];
+        String type = body['type'];
+        
+        RTCSessionDescription answer = RTCSessionDescription(sdp, type);
+        await _peerConnection!.setRemoteDescription(answer);
+        
+        // Start caption polling
+        _startCaptionPolling();
+      } else {
+        setState(() {
+          resultText = "WebRTC setup failed: ${response.statusCode}";
+        });
+      }
+    } catch (e) {
+      setState(() {
+        resultText = "WebRTC error: ${e.toString().substring(0, min(50, e.toString().length))}";
+      });
+    }
+  }
+
+  void _sendIceCandidate(RTCIceCandidate candidate) async {
+    try {
+      await http.post(
+        Uri.parse('$apiBaseUrl/webrtc/candidate'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex,
+        }),
+      );
+    } catch (e) {
+      print("Error sending ICE candidate: $e");
+    }
+  }
+
+  void _startCaptionPolling() {
+    _connectionCheckTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) async {
+      try {
+        final response = await http.get(Uri.parse('$apiBaseUrl/api/caption'));
+        if (response.statusCode == 200) {
+          Map<String, dynamic> body = jsonDecode(response.body);
+          setState(() {
+            resultText = body['caption'];
+          });
+        }
+      } catch (e) {
+        print("Caption polling error: $e");
+      }
+    });
+  }
+
+  // Health check to verify connection to backend
+  Future<bool> _checkServerHealth() async {
+    try {
+      final response = await http.get(Uri.parse('$apiBaseUrl/api/health'));
+      return response.statusCode == 200;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  void _startLiveStreaming() async {
+    if (isStreaming) return;
+    
+    setState(() {
+      isProcessing = true;
+      resultText = "Connecting to AI server...";
+    });
+    
+    // Check server health before attempting connection
+    bool isServerHealthy = await _checkServerHealth();
+    if (!isServerHealthy) {
+      setState(() {
+        isProcessing = false;
+        resultText = "Error: Cannot connect to AI server. Check server address.";
+      });
       return;
     }
     
-    try {
-     
-      XFile imageFile = await _controller.takePicture();
-      File file = File(imageFile.path);
-      
-      var request = http.MultipartRequest('POST', Uri.parse('$apiBaseUrl/api/send_frame'));
-      request.files.add(
-        await http.MultipartFile.fromPath('image', file.path)
-      );
-      
-      var streamResponse = await request.send();
-      if (streamResponse.statusCode == 200) {
-        var responseData = await streamResponse.stream.bytesToString();
-        Map<String, dynamic> jsonResponse = jsonDecode(responseData);
-        if (jsonResponse.containsKey('caption')) {
-          setState(() {
-            resultText = jsonResponse['caption'];
-          });
-        }
-      } else {
-        setState(() {
-          resultText = "Error: Server returned ${streamResponse.statusCode}";
-        });
-      }
-      
-     
-      setState(() {
-        
-        streamImage = Image.network(
-          '$streamUrl?t=${DateTime.now().millisecondsSinceEpoch}',
-          fit: BoxFit.cover,
-          frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
-            return child;
-          },
-          loadingBuilder: (context, child, loadingProgress) {
-            if (loadingProgress == null) return child;
-            return Center(
-              child: CircularProgressIndicator(
-                value: loadingProgress.expectedTotalBytes != null
-                    ? loadingProgress.cumulativeBytesLoaded / loadingProgress.expectedTotalBytes!
-                    : null,
-              ),
-            );
-          },
-          errorBuilder: (context, error, stackTrace) {
-            return Center(
-              child: Text(
-                "Stream connection error. Retrying...",
-                style: TextStyle(color: Colors.white),
-                textAlign: TextAlign.center,
-              ),
-            );
-          },
-        );
-      });
-      
-     
-      await file.delete();
-      
-    } catch (e) {
-      setState(() {
-        resultText = "Error: ${e.toString().substring(0, min(50, e.toString().length))}";
-      });
-    }
-  });
-}
-
-void _stopLiveStreaming() {
-  _streamUpdateTimer?.cancel();
-  _streamUpdateTimer = null;
- 
-  try {
-    http.get(Uri.parse('$apiBaseUrl/api/health'));
-  } catch (e) {
-    // ignore 
+    setState(() {
+      isStreaming = true;
+      isProcessing = false;
+      resultText = "Starting WebRTC connection...";
+    });
+    
+    await _createPeerConnection();
   }
-  
-  setState(() {
-    isStreaming = false;
-    streamImage = null;
-    resultText = "Streaming stopped";
-  });
-}
+
+  void _stopLiveStreaming() {
+    _connectionCheckTimer?.cancel();
+    
+    if (_localStream != null) {
+      _localStream!.getTracks().forEach((track) => track.stop());
+      _localStream = null;
+    }
+    
+    _peerConnection?.close();
+    _peerConnection = null;
+    
+    setState(() {
+      isStreaming = false;
+      _remoteRenderer?.srcObject = null;
+      resultText = "Streaming stopped";
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -301,35 +385,35 @@ void _stopLiveStreaming() {
         backgroundColor: Colors.transparent,
         elevation: 0,
         shadowColor: Colors.transparent,
-       
-actions: [
-  // Video upload button
-  IconButton(
-    icon: Icon(Icons.file_upload, color: Colors.white),
-    onPressed: () {
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (context) => const VideoUploadPage()),
-      );
-    },
-    tooltip: "Upload Video",
-  ),
-  //  exit button
-  IconButton(
-    icon: Icon(Icons.exit_to_app, color: Colors.white),
-    onPressed: () {
-      if (isGeneratingCaptions) {
-        _stopCaptionGeneration();
-      } else if (isStreaming) {
-        _stopLiveStreaming();
-      }
-    },
-    tooltip: "Stop",
-  ),
-],
+        actions: [
+          // Video upload button
+          IconButton(
+            icon: Icon(Icons.file_upload, color: Colors.white),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const VideoUploadPage()),
+              );
+            },
+            tooltip: "Upload Video",
+          ),
+          // Exit button
+          IconButton(
+            icon: Icon(Icons.exit_to_app, color: Colors.white),
+            onPressed: () {
+              if (isGeneratingCaptions) {
+                _stopCaptionGeneration();
+              } else if (isStreaming) {
+                _stopLiveStreaming();
+              }
+            },
+            tooltip: "Stop",
+          ),
+        ],
       ),
       body: Stack(
         children: [
+          // Background gradient
           Container(
             decoration: BoxDecoration(
               gradient: LinearGradient(
@@ -342,87 +426,99 @@ actions: [
             ),
           ),
           
-          
-          Positioned.fill(
-            child: isStreaming 
-              ? (streamImage ?? Container(
-                  color: Colors.black,
-                  child: const Center(
-                    child: Text(
-                      "Connecting to stream...",
-                      style: TextStyle(color: Colors.white),
-                    ),
+          // Video view - either WebRTC remote stream or camera preview
+Positioned.fill(
+  child: isStreaming && _remoteRenderer != null
+    ? Container(
+        padding: const EdgeInsets.only(top: 90, bottom: 150),
+        child: Center(
+          child: Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(0.2),
+                  blurRadius: 15,
+                  spreadRadius: 5,
+                ),
+              ],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(20),
+              child: RTCVideoView(
+                _remoteRenderer!,
+                objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+              ),
+            ),
+          ),
+        ),
+      )
+    : FutureBuilder<void>(
+        future: _initializeControllerFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.done) {
+            final size = MediaQuery.of(context).size;
+            return Container(
+              width: size.width,
+              height: size.height,
+              padding: const EdgeInsets.only(top: 90, bottom: 150),
+              child: Center(
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(20),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.2),
+                        blurRadius: 15,
+                        spreadRadius: 5,
+                      ),
+                    ],
                   ),
-                ))
-              : FutureBuilder<void>(
-                  future: _initializeControllerFuture,
-                  builder: (context, snapshot) {
-                    if (snapshot.connectionState == ConnectionState.done) {
-                      final size = MediaQuery.of(context).size;
-                      return Container(
-                        width: size.width,
-                        height: size.height,
-                        padding: const EdgeInsets.only(top: 0, bottom: 100),
-                        child: Center(
-                          child: Container(
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(20),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: Colors.black.withOpacity(0.2),
-                                  blurRadius: 15,
-                                  spreadRadius: 5,
-                                ),
-                              ],
-                            ),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(20),
-                              child: Transform.rotate(
-                                angle: 90 * (3.1415926535897932 / 180),
-                                child: SizedBox(
-                                  width: size.height,
-                                  height: size.width,
-                                  child: ClipRect(
-                                    child: OverflowBox(
-                                      alignment: Alignment.center,
-                                      child: FittedBox(
-                                        fit: BoxFit.cover,
-                                        child: SizedBox(
-                                          width: size.height * _controller.value.aspectRatio,
-                                          height: size.height,
-                                          child: CameraPreview(_controller),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(20),
+                    child: SizedBox(
+                      width: size.height,
+                      height: size.width,
+                      child: ClipRect(
+                        child: OverflowBox(
+                          alignment: Alignment.center,
+                          child: FittedBox(
+                            fit: BoxFit.cover,
+                            child: SizedBox(
+                              width: size.width - 40,
+                              height: (size.width - 40) * _controller.value.aspectRatio,
+                              child: CameraPreview(_controller),
                             ),
                           ),
                         ),
-                      );
-                    } else {
-                      return Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const CircularProgressIndicator(),
-                            const SizedBox(height: 16),
-                            Text(
-                              "Initializing camera...",
-                              style: TextStyle(
-                                color: Theme.of(context).colorScheme.secondary,
-                              ),
-                            ),
-                          ],
-                        ),
-                      );
-                    }
-                  },
+                      ),
+                    ),
+                  ),
                 ),
-          ),
+              ),
+            );
+          } else {
+            return Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const CircularProgressIndicator(),
+                  const SizedBox(height: 16),
+                  Text(
+                    "Initializing camera...",
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.secondary,
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }
+        },
+      ),
+),
           
-          // Loading 
+          // Loading indicator
           if (isProcessing)
             Container(
               color: Colors.black.withOpacity(0.5),
@@ -441,26 +537,36 @@ actions: [
               ),
             ),
 
-          
+          // Caption display - Updated with better styling
           if (resultText != null)
             Positioned(
               top: 100,
               left: 0,
               right: 0,
               child: Container(
-                padding: EdgeInsets.all(8),
-                margin: EdgeInsets.symmetric(horizontal: 12),
+                padding: EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+                margin: EdgeInsets.symmetric(horizontal: 24),
                 decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(8),
+                  color: Colors.black.withOpacity(0.7),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: Colors.white.withOpacity(0.3),
+                    width: 1.0,
+                  ),
                 ),
                 child: Text(
                   resultText!,
-                  style: TextStyle(color: Colors.white),
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w500,
+                  ),
                   textAlign: TextAlign.center,
                 ),
               ),
             ),
+            
+          // Control buttons
           Align(
             alignment: const Alignment(0.0, 0.85),
             child: Container(
@@ -485,30 +591,25 @@ actions: [
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
-                      
+                      // Caption button (replacing Text button)
                       GestureDetector(
                         onTap: () {
-                          // nothing doing 
-                          setState(() {
-                            resultText = "Text button is disabled";
-                          });
-                          // auto clearing happening after 2 seconds 
-                          Timer(Duration(seconds: 2), () {
-                            if (mounted) {
-                              setState(() {
-                                resultText = null;
-                              });
-                            }
-                          });
+                          if (isGeneratingCaptions) {
+                            _stopCaptionGeneration();
+                          } else {
+                            _startCaptionGeneration();
+                          }
                         },
                         child: Container(
                           width: 120,
                           padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 8),
                           decoration: BoxDecoration(
-                            color: Colors.transparent,
+                            color: isGeneratingCaptions ? Colors.white : Colors.transparent,
                             borderRadius: BorderRadius.circular(16),
                             border: Border.all(
-                              color: Colors.grey.withOpacity(0.5),
+                              color: isGeneratingCaptions
+                                ? Theme.of(context).colorScheme.primary 
+                                : Colors.grey.withOpacity(0.5),
                               width: 2,
                             ),
                           ),
@@ -516,17 +617,21 @@ actions: [
                             mainAxisSize: MainAxisSize.min,
                             children: [
                               Icon(
-                                Icons.text_fields,
+                                isGeneratingCaptions ? Icons.stop : Icons.subtitles,
                                 size: 36,
-                                color: Theme.of(context).colorScheme.onSurface,
+                                color: isGeneratingCaptions
+                                  ? Theme.of(context).colorScheme.primary
+                                  : Theme.of(context).colorScheme.onSurface,
                               ),
                               const SizedBox(height: 8),
                               Text(
-                                "TEXT",
+                                isGeneratingCaptions ? "STOP" : "CAPTION",
                                 style: TextStyle(
                                   fontSize: 14,
                                   fontWeight: FontWeight.bold,
-                                  color: Theme.of(context).colorScheme.onSurface,
+                                  color: isGeneratingCaptions
+                                    ? Theme.of(context).colorScheme.primary
+                                    : Theme.of(context).colorScheme.onSurface,
                                 ),
                               ),
                             ],
@@ -536,7 +641,7 @@ actions: [
                       
                       const SizedBox(width: 16),
                       
-                      // toggling live stream 
+                      // Stream button
                       GestureDetector(
                         onTap: () {
                           if (isStreaming) {
